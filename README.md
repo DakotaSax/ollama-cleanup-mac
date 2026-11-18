@@ -4,7 +4,7 @@ Identify and remove orphaned model files left behind after an Ollama upgrade.
 
 ## The problem
 
-When Ollama is upgraded, some older models may become unsupported and disappear from `ollama list` but their blobs and manifest files remain on disk, consuming significant storage. Since `ollama rm` only works on models Ollama still recognises, there's built-in way to clean these up.
+When Ollama is upgraded, some older models may become unsupported and disappear from `ollama list` but their blobs and manifest files remain on disk, consuming significant storage. Since `ollama rm` only removes active models, it cannot clean up these orphaned files.
 
 ## What this does
 
@@ -18,16 +18,19 @@ When Ollama is upgraded, some older models may become unsupported and disappear 
 
 ## Requirements
 
+- **macOS**
 - **Ollama** (installed and running)
-- **jq** — for parsing manifest JSON (`sudo apt install jq`)
-- **bash** 4.0+
+- **jq** — for parsing manifest JSON (`brew install jq`)
+- **Bash 4.0+** — macOS includes Bash 3.2 by default, so install a newer Bash with Homebrew (`brew install bash`)
+- **bc** — for human-readable size calculations (`brew install bc`)
+- **Homebrew** — used to install the macOS command-line dependencies
 
 ## Usage
 
 ```bash
 # Clone or download
-git clone https://github.com/sheppoor/ollama-cleanup.git
-cd ollama-cleanup
+git clone https://github.com/DakotaSax/ollama-cleanup-mac.git
+cd ollama-cleanup-mac
 
 # Make executable
 chmod +x ollama-cleanup.sh
