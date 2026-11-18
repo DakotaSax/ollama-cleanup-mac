@@ -31,13 +31,15 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --models-dir)
+            if [[ $# -lt 2 ]]; then echo "ERROR: --models-dir requires a path." >&2; exit 1; fi
             MODELS_DIR="$2"; shift 2 ;;
         --output)
+            if [[ $# -lt 2 ]]; then echo "ERROR: --output requires a path." >&2; exit 1; fi
             OUTPUT_SCRIPT="$2"; shift 2 ;;
         --dry-run)
             DRY_RUN=true; shift ;;
         -h|--help)
-            sed -n '3,14p' "$0" | sed 's/^# \?//'
+            sed -n '3,17p' "$0" | sed 's/^# \?//'
             exit 0 ;;
         *)
             echo "Unknown option: $1" >&2; exit 1 ;;
@@ -47,17 +49,35 @@ done
 BLOBS_DIR="${MODELS_DIR}/blobs"
 MANIFESTS_DIR="${MODELS_DIR}/manifests"
 
+# Use temporary newline-delimited files for membership checks. This avoids
+# Bash 4-only associative arrays and lets the script run with macOS Bash 3.2.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ollama-cleanup.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+trap 'exit 1' HUP INT TERM
+REFERENCED_BLOBS_FILE="${TMP_DIR}/referenced-blobs"
+ACTIVE_MANIFEST_DIRS_FILE="${TMP_DIR}/active-manifest-dirs"
+ACTIVE_MANIFEST_FILES_FILE="${TMP_DIR}/active-manifest-files"
+ORPHAN_MANIFEST_BLOBS_FILE="${TMP_DIR}/orphan-manifest-blobs"
+: > "$REFERENCED_BLOBS_FILE"
+: > "$ACTIVE_MANIFEST_DIRS_FILE"
+: > "$ACTIVE_MANIFEST_FILES_FILE"
+: > "$ORPHAN_MANIFEST_BLOBS_FILE"
+
+contains_line() {
+    grep -Fqx "$1" "$2"
+}
+
 # ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
-if ! command -v ollama &>/dev/null; then
+if ! command -v ollama >/dev/null 2>&1; then
     echo "ERROR: 'ollama' command not found. Is Ollama installed?" >&2
     exit 1
 fi
 
-if ! command -v jq &>/dev/null; then
+if ! command -v jq >/dev/null 2>&1; then
     echo "ERROR: 'jq' is required but not installed." >&2
-    echo "       Install it with: sudo apt install jq" >&2
+    echo "       Install it with: brew install jq" >&2
     exit 1
 fi
 
@@ -76,8 +96,11 @@ echo ""
 echo "--- Active models (from 'ollama list') ---"
 
 # ollama list output: NAME ID SIZE MODIFIED
-# The NAME column is like "llama3:latest" or "mymodel:v2"
-mapfile -t ACTIVE_MODELS < <(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
+# Bash 3.2 has no mapfile, so read the model names into an indexed array.
+ACTIVE_MODELS=()
+while IFS= read -r model_name; do
+    [[ -n "$model_name" ]] && ACTIVE_MODELS+=("$model_name")
+done < <(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}')
 
 if [[ ${#ACTIVE_MODELS[@]} -eq 0 ]]; then
     echo "(none)"
@@ -97,33 +120,24 @@ echo ""
 # ---------------------------------------------------------------------------
 # Active model names are like "llama3:latest". The manifest lives at:
 #   manifests/registry.ollama.ai/library/<model>/<tag>
-#
-# Some models may use a custom registry or namespace, e.g. "user/model:tag",
-# which maps to: manifests/registry.ollama.ai/<user>/<model>/<tag>
-#
-# We also need to handle the default registry if the name has no slash.
+# Namespaced models map to:
+#   manifests/registry.ollama.ai/<user>/<model>/<tag>
 
-declare -A REFERENCED_BLOBS   # set of blob filenames we want to keep
-declare -A ACTIVE_MANIFEST_DIRS  # set of manifest directories to keep
-declare -A ACTIVE_MANIFEST_FILES # set of manifest files to keep
+declare -a ACTIVE_MANIFEST_DIRS=()
+declare -a ACTIVE_MANIFEST_FILES=()
 
 for model_tag in "${ACTIVE_MODELS[@]}"; do
-    # Split model_tag into model and tag
     model="${model_tag%%:*}"
     tag="${model_tag##*:}"
-    # If no tag was specified (no colon), default to "latest"
     if [[ "$model" == "$tag" ]]; then
         tag="latest"
     fi
 
-    # Determine manifest path
     if [[ "$model" == */* ]]; then
-        # Has a namespace: user/modelname
         namespace="${model%%/*}"
         name="${model##*/}"
         manifest_file="${MANIFESTS_DIR}/registry.ollama.ai/${namespace}/${name}/${tag}"
     else
-        # Default library namespace
         manifest_file="${MANIFESTS_DIR}/registry.ollama.ai/library/${model}/${tag}"
     fi
 
@@ -133,17 +147,15 @@ for model_tag in "${ACTIVE_MODELS[@]}"; do
         continue
     fi
 
-    # Track the manifest file and its parent directory
-    ACTIVE_MANIFEST_FILES["${manifest_file}"]=1
+    ACTIVE_MANIFEST_FILES+=("$manifest_file")
+    printf '%s\n' "$manifest_file" >> "$ACTIVE_MANIFEST_FILES_FILE"
     model_dir="$(dirname "$manifest_file")"
-    ACTIVE_MANIFEST_DIRS["${model_dir}"]=1
+    ACTIVE_MANIFEST_DIRS+=("$model_dir")
+    printf '%s\n' "$model_dir" >> "$ACTIVE_MANIFEST_DIRS_FILE"
 
-    # Parse the manifest JSON to extract all referenced digests
-    # Manifests have: config.digest, and layers[].digest
     while IFS= read -r digest; do
-        # Convert "sha256:abc123..." to blob filename "sha256-abc123..."
         blob_name="${digest/:/-}"
-        REFERENCED_BLOBS["${blob_name}"]=1
+        printf '%s\n' "$blob_name" >> "$REFERENCED_BLOBS_FILE"
     done < <(jq -r '
         [ .config.digest // empty ] +
         [ .layers[]?.digest // empty ] |
@@ -151,7 +163,8 @@ for model_tag in "${ACTIVE_MODELS[@]}"; do
     ' "$manifest_file" 2>/dev/null)
 done
 
-echo "Referenced blobs (in use): ${#REFERENCED_BLOBS[@]}"
+REFERENCED_BLOB_COUNT="$(sort -u "$REFERENCED_BLOBS_FILE" | wc -l | tr -d '[:space:]')"
+echo "Referenced blobs (in use): ${REFERENCED_BLOB_COUNT}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -161,35 +174,38 @@ declare -a ORPHANED_MANIFEST_FILES=()
 declare -a ORPHANED_MANIFEST_DIRS=()
 
 if [[ -d "$MANIFESTS_DIR" ]]; then
-    # Find all manifest files (they're the leaf files in the tree)
     while IFS= read -r mf; do
-        if [[ -z "${ACTIVE_MANIFEST_FILES[$mf]+_}" ]]; then
+        if ! contains_line "$mf" "$ACTIVE_MANIFEST_FILES_FILE"; then
             ORPHANED_MANIFEST_FILES+=("$mf")
         fi
     done < <(find "$MANIFESTS_DIR" -type f 2>/dev/null)
 
-    # Find model directories that can be removed entirely
-    # These are directories at the model-name level (parent of tag files)
-    # that contain no active manifests
+    # macOS/BSD find does not support GNU find's -maxdepth option. Inspect
+    # directories portably and only consider directories containing files
+    # directly (the model/tag-directory level of Ollama's manifest tree).
     while IFS= read -r mdir; do
-        if [[ -z "${ACTIVE_MANIFEST_DIRS[$mdir]+_}" ]]; then
-            # Verify this looks like a model dir (has files, not just subdirs)
-            if find "$mdir" -maxdepth 1 -type f | grep -q .; then
+        if ! contains_line "$mdir" "$ACTIVE_MANIFEST_DIRS_FILE"; then
+            has_direct_file=false
+            for entry in "$mdir"/*; do
+                if [[ -f "$entry" ]]; then
+                    has_direct_file=true
+                    break
+                fi
+            done
+            if [[ "$has_direct_file" == true ]]; then
                 ORPHANED_MANIFEST_DIRS+=("$mdir")
             fi
         fi
-    done < <(find "$MANIFESTS_DIR" -mindepth 3 -maxdepth 4 -type d 2>/dev/null)
+    done < <(find "$MANIFESTS_DIR" -type d 2>/dev/null)
 fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Collect blobs referenced by orphaned manifests
 # ---------------------------------------------------------------------------
-declare -A ORPHAN_MANIFEST_BLOBS  # blobs referenced by orphaned manifests
-
 for mf in "${ORPHANED_MANIFEST_FILES[@]}"; do
     while IFS= read -r digest; do
         blob_name="${digest/:/-}"
-        ORPHAN_MANIFEST_BLOBS["${blob_name}"]=1
+        printf '%s\n' "$blob_name" >> "$ORPHAN_MANIFEST_BLOBS_FILE"
     done < <(jq -r '
         [ .config.digest // empty ] +
         [ .layers[]?.digest // empty ] |
@@ -200,17 +216,18 @@ done
 # ---------------------------------------------------------------------------
 # Step 5: Find orphaned blobs and classify them
 # ---------------------------------------------------------------------------
-declare -a ORPHANED_BLOBS=()        # referenced by orphaned manifests only
-declare -a FULLY_ORPHANED_BLOBS=()  # not referenced by any manifest
+declare -a ORPHANED_BLOBS=()
+declare -a FULLY_ORPHANED_BLOBS=()
 ORPHANED_BYTES=0
 FULLY_ORPHANED_BYTES=0
 
 if [[ -d "$BLOBS_DIR" ]]; then
     while IFS= read -r blob_path; do
         blob_name="$(basename "$blob_path")"
-        if [[ -z "${REFERENCED_BLOBS[$blob_name]+_}" ]]; then
-            size=$(stat --printf="%s" "$blob_path" 2>/dev/null || echo 0)
-            if [[ -n "${ORPHAN_MANIFEST_BLOBS[$blob_name]+_}" ]]; then
+        if ! contains_line "$blob_name" "$REFERENCED_BLOBS_FILE"; then
+            # macOS stat uses -f (unlike GNU stat's --printf).
+            size="$(stat -f%z "$blob_path" 2>/dev/null || echo 0)"
+            if contains_line "$blob_name" "$ORPHAN_MANIFEST_BLOBS_FILE"; then
                 ORPHANED_BLOBS+=("$blob_path")
                 ORPHANED_BYTES=$((ORPHANED_BYTES + size))
             else
@@ -244,7 +261,7 @@ echo "  Orphaned blobs:       ${#ORPHANED_BLOBS[@]}  (referenced by orphaned man
 echo "  Fully orphaned blobs: ${#FULLY_ORPHANED_BLOBS[@]}  (not in any manifest)"
 echo "  Orphaned manifests:   ${#ORPHANED_MANIFEST_FILES[@]}"
 echo "  Orphaned model dirs:  ${#ORPHANED_MANIFEST_DIRS[@]}"
-echo "  Reclaimable space:    $(human_size $TOTAL_BLOB_BYTES) (blobs only)"
+echo "  Reclaimable space:    $(human_size "$TOTAL_BLOB_BYTES") (blobs only)"
 echo ""
 
 TOTAL_ORPHANS=$(( ${#ORPHANED_BLOBS[@]} + ${#FULLY_ORPHANED_BLOBS[@]} + ${#ORPHANED_MANIFEST_FILES[@]} + ${#ORPHANED_MANIFEST_DIRS[@]} ))
@@ -322,19 +339,17 @@ safe_rmdir() {
 
 HEADER
 
-# Write orphaned blob removals
 if [[ ${#ORPHANED_BLOBS[@]} -gt 0 ]]; then
     {
         echo ""
         echo "# --- Orphaned blobs ---"
         for blob in "${ORPHANED_BLOBS[@]}"; do
-            size=$(stat --printf="%s" "$blob" 2>/dev/null || echo 0)
-            echo "safe_rm \"${blob}\"  # $(human_size $size)"
+            size="$(stat -f%z "$blob" 2>/dev/null || echo 0)"
+            echo "safe_rm \"${blob}\"  # $(human_size "$size")"
         done
     } >> "$OUTPUT_SCRIPT"
 fi
 
-# Write orphaned manifest file removals
 if [[ ${#ORPHANED_MANIFEST_FILES[@]} -gt 0 ]]; then
     {
         echo ""
@@ -345,7 +360,6 @@ if [[ ${#ORPHANED_MANIFEST_FILES[@]} -gt 0 ]]; then
     } >> "$OUTPUT_SCRIPT"
 fi
 
-# Write orphaned manifest directory removals
 if [[ ${#ORPHANED_MANIFEST_DIRS[@]} -gt 0 ]]; then
     {
         echo ""
@@ -356,22 +370,21 @@ if [[ ${#ORPHANED_MANIFEST_DIRS[@]} -gt 0 ]]; then
     } >> "$OUTPUT_SCRIPT"
 fi
 
-# Write fully orphaned blobs section (separate confirmation)
 if [[ ${#FULLY_ORPHANED_BLOBS[@]} -gt 0 ]]; then
     {
         echo ""
         echo "# --- Fully orphaned blobs (not referenced by any manifest) ---"
         echo "echo \"\""
         echo "echo \"=== Fully Orphaned Blobs ===\""
-        echo "echo \"The following ${#FULLY_ORPHANED_BLOBS[@]} blob(s) ($(human_size $FULLY_ORPHANED_BYTES)) are not referenced\""
+        echo "echo \"The following ${#FULLY_ORPHANED_BLOBS[@]} blob(s) ($(human_size "$FULLY_ORPHANED_BYTES")) are not referenced\""
         echo "echo \"by any manifest file — active or orphaned. These may be leftover\""
         echo "echo \"from interrupted downloads or previous cleanup.\""
         echo "echo \"\""
         echo "read -rp \"Delete fully orphaned blobs? [y/N] \" confirm_fully"
         echo "if [[ \"\$confirm_fully\" =~ ^[Yy]\$ ]]; then"
         for blob in "${FULLY_ORPHANED_BLOBS[@]}"; do
-            size=$(stat --printf="%s" "$blob" 2>/dev/null || echo 0)
-            echo "    safe_rm \"${blob}\"  # $(human_size $size)"
+            size="$(stat -f%z "$blob" 2>/dev/null || echo 0)"
+            echo "    safe_rm \"${blob}\"  # $(human_size "$size")"
         done
         echo "else"
         echo "    echo \"Skipped fully orphaned blobs.\""
@@ -379,7 +392,6 @@ if [[ ${#FULLY_ORPHANED_BLOBS[@]} -gt 0 ]]; then
     } >> "$OUTPUT_SCRIPT"
 fi
 
-# Write footer
 cat >> "$OUTPUT_SCRIPT" << 'FOOTER'
 
 echo ""
