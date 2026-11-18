@@ -1,10 +1,10 @@
-# ollama-cleanup
+# ollama-cleanup-mac
 
-Identify and remove orphaned model files left behind after an Ollama upgrade.
+A macOS port of the Ollama cleanup utility that identifies and removes orphaned model files left behind after an Ollama upgrade.
 
 ## The problem
 
-When Ollama is upgraded, some older models may become unsupported and disappear from `ollama list` but their blobs and manifest files remain on disk, consuming significant storage. Since `ollama rm` only removes active models, it cannot clean up these orphaned files.
+When Ollama is upgraded, some older models may become unsupported and disappear from `ollama list`, but their blobs and manifest files remain on disk and consume significant storage. Since `ollama rm` only removes active models, it cannot clean up these orphaned files.
 
 ## What this does
 
@@ -14,16 +14,17 @@ When Ollama is upgraded, some older models may become unsupported and disappear 
 2. Parses manifest JSON files to determine which blobs are still referenced.
 3. Identifies orphaned blobs and manifests that are no longer needed.
 4. Distinguishes **fully orphaned blobs** (not referenced by any manifest) from blobs referenced only by orphaned manifests.
-5. Generates a **human-reviewable** `ollama-clean-delete.sh` script, nothing is deleted automatically.
+5. Generates a **human-reviewable** `ollama-clean-delete.sh` script; nothing is deleted automatically.
 
 ## Requirements
 
 - **macOS**
 - **Ollama** (installed and running)
 - **jq** — for parsing manifest JSON (`brew install jq`)
-- **Bash 4.0+** — macOS includes Bash 3.2 by default, so install a newer Bash with Homebrew (`brew install bash`)
 - **bc** — for human-readable size calculations (`brew install bc`)
-- **Homebrew** — used to install the macOS command-line dependencies
+- **Homebrew** — recommended for installing the macOS command-line dependencies
+
+The script is compatible with macOS’s default Bash 3.2. Bash 4.0 or newer is not required.
 
 ## Usage
 
@@ -93,8 +94,8 @@ Each manifest file is JSON containing a `config.digest` and a `layers[].digest` 
 
 The script parses every active model's manifest to build the set of referenced blobs, then flags anything outside that set as orphaned. Orphaned blobs are further classified:
 
-- **Orphaned blobs** - referenced by an orphaned manifest but not by any active model.
-- **Fully orphaned blobs** - not referenced by any manifest at all (active or orphaned). These may be remnants of interrupted downloads or previous partial cleanup.
+- **Orphaned blobs** — referenced by an orphaned manifest but not by any active model.
+- **Fully orphaned blobs** — not referenced by any manifest at all (active or orphaned). These may be remnants of interrupted downloads or previous partial cleanup.
 
 ## Safety
 
