@@ -43,6 +43,17 @@ Open a new Terminal window, or reload your shell configuration, then run:
 ollama-cleanup
 ```
 
+## Uninstall
+
+From the cloned repository directory, run:
+
+```bash
+chmod +x uninstall.sh
+./uninstall.sh
+```
+
+This removes the installed `~/.local/bin/ollama-cleanup` command and the PATH entry added by the installer. It does not remove the cloned repository, generated removal scripts, or any Ollama models or data. Open a new Terminal window (or restart your shell) to finish uninstalling.
+
 ## Run without installing
 
 ```bash
